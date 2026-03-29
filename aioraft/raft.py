@@ -11,7 +11,7 @@ from aioraft.protos import raft_pb2
 from aioraft.server import AbstractRaftServer
 from aioraft.state_machine import StateMachine
 from aioraft.storage import Storage
-from aioraft.types import RaftId, RaftState, aobject
+from aioraft.types import CONF_CHANGE_ADD, CONF_CHANGE_REMOVE, RaftId, RaftState, aobject
 from aioraft.utils import AtomicInteger, randrangef
 
 logging.basicConfig(level=logging.INFO)
@@ -106,6 +106,8 @@ class Raft(aobject, AbstractRaftProtocol):
             if snapshot is not None:
                 self.__last_included_index = snapshot[0]
                 self.__last_included_term = snapshot[1]
+            # Rebuild configuration from persisted log entries
+            self._rebuild_configuration_from_log()
         else:
             await self._initialize_persistent_state()
         await self._initialize_volatile_state()
@@ -404,6 +406,76 @@ class Raft(aobject, AbstractRaftProtocol):
             except asyncio.TimeoutError:
                 continue  # re-check leadership
 
+    def _rebuild_configuration_from_log(self) -> None:
+        """Replay config change entries from the log to rebuild the configuration set.
+        Called on startup after loading logs from storage."""
+        for entry in self.__log:
+            if entry.command.startswith(CONF_CHANGE_ADD):
+                address = RaftId(entry.command.split(":", 1)[1])
+                self.__configuration.add(address)
+            elif entry.command.startswith(CONF_CHANGE_REMOVE):
+                address = RaftId(entry.command.split(":", 1)[1])
+                self.__configuration.discard(address)
+
+    @staticmethod
+    def _is_config_change(command: str) -> bool:
+        """Return True if the command is a configuration change entry."""
+        return command.startswith(CONF_CHANGE_ADD) or command.startswith(CONF_CHANGE_REMOVE)
+
+    def _has_pending_config_change(self) -> bool:
+        """Check if there's an uncommitted config change in the log."""
+        for i in range(self.__commit_index + 1, self.__last_included_index + len(self.__log) + 1):
+            entry = self._log_at_index(i)
+            if entry and self._is_config_change(entry.command):
+                return True
+        return False
+
+    async def add_server(self, address: RaftId) -> Tuple[bool, str]:
+        """Add a server to the cluster. Must be called on the leader."""
+        if not self.has_leadership():
+            return (False, "not leader")
+        if address in self.__configuration or address == self.__id:
+            return (False, "server already in cluster")
+        if self._has_pending_config_change():
+            return (False, "another config change is pending")
+        # Append config change entry
+        entry = await self._append_entry(f"{CONF_CHANGE_ADD}:{address}")
+        # Immediately add to configuration (Raft says config takes effect on log append)
+        self.__configuration.add(address)
+        # Initialize nextIndex/matchIndex for new server
+        self.__next_index[address] = 1  # Start from beginning so new server catches up
+        self.__match_index[address] = 0
+        # Wait for commit
+        try:
+            await asyncio.wait_for(self._wait_for_commit(entry.index), timeout=10.0)
+        except (asyncio.TimeoutError, RuntimeError):
+            return (False, "failed to commit config change")
+        return (True, "")
+
+    async def remove_server(self, address: RaftId) -> Tuple[bool, str]:
+        """Remove a server from the cluster. Must be called on the leader."""
+        if not self.has_leadership():
+            return (False, "not leader")
+        if address not in self.__configuration and address != self.__id:
+            return (False, "server not in cluster")
+        if self._has_pending_config_change():
+            return (False, "another config change is pending")
+        entry = await self._append_entry(f"{CONF_CHANGE_REMOVE}:{address}")
+        # Config takes effect immediately
+        self.__configuration.discard(address)
+        if address in self.__next_index:
+            del self.__next_index[address]
+        if address in self.__match_index:
+            del self.__match_index[address]
+        try:
+            await asyncio.wait_for(self._wait_for_commit(entry.index), timeout=10.0)
+        except (asyncio.TimeoutError, RuntimeError):
+            return (False, "failed to commit config change")
+        # If we removed ourselves, step down
+        if address == self.__id:
+            await self.__change_state(RaftState.FOLLOWER)
+        return (True, "")
+
     def has_leadership(self) -> bool:
         return self.__state is RaftState.LEADER
 
@@ -500,6 +572,15 @@ class Raft(aobject, AbstractRaftProtocol):
                 await self.__storage.append_logs(new_entries_to_append)
             self.__log.extend(new_entries_to_append)
 
+        # Apply configuration changes from new entries immediately
+        for entry in new_entries_to_append:
+            if entry.command.startswith(CONF_CHANGE_ADD):
+                address = RaftId(entry.command.split(":", 1)[1])
+                self.__configuration.add(address)
+            elif entry.command.startswith(CONF_CHANGE_REMOVE):
+                address = RaftId(entry.command.split(":", 1)[1])
+                self.__configuration.discard(address)
+
         # Rule 5: advance commitIndex
         # Per Raft paper: set commitIndex = min(leaderCommit, index of last new entry)
         if leader_commit > self.__commit_index:
@@ -560,6 +641,8 @@ class Raft(aobject, AbstractRaftProtocol):
                 # (all nodes apply the same sequence).
                 self.__last_applied += 1
                 entry = self._log_at_index(self.__last_applied)
+                if entry and self._is_config_change(entry.command):
+                    continue  # Config changes don't go to state machine
                 if entry and self.__state_machine:
                     try:
                         await self.__state_machine.apply(entry.command)
@@ -709,3 +792,8 @@ class Raft(aobject, AbstractRaftProtocol):
     @property
     def quorum(self) -> int:
         return math.floor(self.membership / 2) + 1
+
+    @property
+    def configuration(self) -> Set[RaftId]:
+        """Return the current cluster membership (peers, excluding self)."""
+        return set(self.__configuration)
