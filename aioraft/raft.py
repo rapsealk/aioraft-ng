@@ -3,7 +3,7 @@ import inspect
 import logging
 import math
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, Final, Iterable, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, Final, Iterable, List, Optional, Set, Tuple
 
 from aioraft.client import AbstractRaftClient
 from aioraft.protocol import AbstractRaftProtocol
@@ -202,6 +202,7 @@ class Raft(aobject, AbstractRaftProtocol):
             self.__voted_for = self.id
 
         current_term = self.current_term
+        last_log_index, last_log_term = self._get_last_log_info()
         logging.info(f"[{datetime.now()}] id={self.id} Campaign(term={current_term})")
 
         terms, grants = zip(
@@ -212,8 +213,8 @@ class Raft(aobject, AbstractRaftProtocol):
                             to=server,
                             term=current_term,
                             candidate_id=self.id,
-                            last_log_index=0,
-                            last_log_term=0,
+                            last_log_index=last_log_index,
+                            last_log_term=last_log_term,
                         ),
                     )
                     for server in self.__configuration
@@ -318,12 +319,17 @@ class Raft(aobject, AbstractRaftProtocol):
                 break
 
     async def _wait_for_commit(self, index: int) -> None:
-        """Block until commitIndex >= index."""
+        """Block until commitIndex >= index. Raises RuntimeError if leadership is lost."""
         while self.__commit_index < index:
+            if not self.has_leadership():
+                raise RuntimeError("lost leadership")
             self.__commit_event.clear()
             if self.__commit_index >= index:
                 return
-            await self.__commit_event.wait()
+            try:
+                await asyncio.wait_for(self.__commit_event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue  # re-check leadership
 
     def has_leadership(self) -> bool:
         return self.__state is RaftState.LEADER
@@ -347,16 +353,11 @@ class Raft(aobject, AbstractRaftProtocol):
         # Wait for the entry to be committed (replicated to a majority)
         try:
             await asyncio.wait_for(self._wait_for_commit(target_index), timeout=5.0)
-        except asyncio.TimeoutError:
-            return (False, "timeout waiting for commit", None)
+        except (asyncio.TimeoutError, RuntimeError):
+            return (False, "lost leadership or timeout", None)
 
-        # Apply and get result
-        if self.__state_machine:
-            try:
-                result = await self.__state_machine.apply(command)
-                return (True, str(result) if result is not None else "", None)
-            except Exception as e:
-                return (False, str(e), None)
+        # The background _apply_committed_entries loop handles applying to
+        # the state machine, so we don't apply inline (avoids double-apply).
         return (True, "", None)
 
     async def on_append_entries(
@@ -405,9 +406,13 @@ class Raft(aobject, AbstractRaftProtocol):
                 self.__log.append(new_entry)
 
         # Rule 5: advance commitIndex
+        # Per Raft paper: set commitIndex = min(leaderCommit, index of last new entry)
         if leader_commit > self.__commit_index:
-            last_new_index = prev_log_index + len(entries_list) if entries_list else len(self.__log)
-            self.__commit_index = min(leader_commit, max(last_new_index, len(self.__log)))
+            if entries_list:
+                last_new_index = entries_list[-1].index
+            else:
+                last_new_index = prev_log_index  # heartbeat case
+            self.__commit_index = min(leader_commit, last_new_index)
             self.__commit_event.set()
 
         return (self.current_term, True)
@@ -430,6 +435,14 @@ class Raft(aobject, AbstractRaftProtocol):
 
             async with self.__vote_lock:
                 if self.voted_for in [None, candidate_id]:
+                    # Section 5.4.1: only grant vote if candidate's log is
+                    # at least as up-to-date as ours.
+                    my_last_index, my_last_term = self._get_last_log_info()
+                    if last_log_term < my_last_term:
+                        return (self.current_term, False)
+                    if last_log_term == my_last_term and last_log_index < my_last_index:
+                        return (self.current_term, False)
+
                     log.debug(
                         f"[on_request_vote] TRUE id={self.__id[-5:]} current_term={current_term} candidate={candidate_id[-5:]} term={term} voted_for={self.voted_for}"
                     )
@@ -471,6 +484,13 @@ class Raft(aobject, AbstractRaftProtocol):
         if n > self.__commit_index:
             self.__commit_index = n
             self.__commit_event.set()
+
+    def _get_last_log_info(self) -> Tuple[int, int]:
+        """Return (last_log_index, last_log_term) for the local log."""
+        if self.__log:
+            last = self.__log[-1]
+            return (last.index, last.term)
+        return (0, 0)
 
     def _log_at_index(self, index: int) -> Optional[raft_pb2.Log]:
         """Return the log entry at the given 1-based index, or None."""
