@@ -306,9 +306,10 @@ class Raft(aobject, AbstractRaftProtocol):
     async def _apply_committed_entries(self) -> None:
         """Background task: apply committed entries to state machine."""
         while True:
-            await self.__commit_event.wait()
-            self.__commit_event.clear()
             while self.__last_applied < self.__commit_index:
+                # Entry is marked applied before execution. If apply() fails,
+                # the entry is skipped to maintain consistency with peers
+                # (all nodes apply the same sequence).
                 self.__last_applied += 1
                 entry = self._log_at_index(self.__last_applied)
                 if entry and self.__state_machine:
@@ -316,6 +317,22 @@ class Raft(aobject, AbstractRaftProtocol):
                         await self.__state_machine.apply(entry.command)
                     except Exception as e:
                         log.error(f"Failed to apply entry {self.__last_applied}: {e}")
+            self.__commit_event.clear()
+            # Re-check after clearing to avoid race where a set() between
+            # the end of the drain loop and clear() would be lost.
+            if self.__last_applied < self.__commit_index:
+                continue
+            await self.__commit_event.wait()
+
+    def _update_commit_index(self, n: int) -> None:
+        """Advance commitIndex to n and wake the apply loop.
+
+        Called by the leader when a majority of matchIndex[i] >= n and
+        log[n].term == currentTerm (Raft paper §5.3/§5.4).
+        """
+        if n > self.__commit_index:
+            self.__commit_index = n
+            self.__commit_event.set()
 
     def _log_at_index(self, index: int) -> Optional[raft_pb2.Log]:
         """Return the log entry at the given 1-based index, or None."""

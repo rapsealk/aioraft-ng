@@ -5,11 +5,20 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from aioraft import KeyValueStateMachine, Raft, StateMachine
+from aioraft import KeyValueStateMachine, Raft
 from aioraft.client import GrpcRaftClient
 from aioraft.protos import raft_pb2
 from aioraft.server import GrpcRaftServer
 from aioraft.types import RaftState
+
+
+async def wait_until(pred, timeout=1.0):
+    """Poll *pred* until it returns True, or raise TimeoutError."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while not pred():
+        if asyncio.get_event_loop().time() > deadline:
+            raise TimeoutError("wait_until timed out")
+        await asyncio.sleep(0.001)
 
 
 @pytest.mark.asyncio
@@ -276,10 +285,9 @@ class TestApplyLoop:
             raft._Raft__commit_index = 2
             raft._Raft__commit_event.set()
 
-            # Give the loop a chance to run
-            await asyncio.sleep(0.05)
+            # Wait for the loop to drain
+            await wait_until(lambda: raft.last_applied == 2)
 
-            assert raft.last_applied == 2
             assert sm._store == {"a": "1", "b": "2"}
         finally:
             task.cancel()
@@ -313,11 +321,9 @@ class TestApplyLoop:
             raft._Raft__commit_index = 2
             raft._Raft__commit_event.set()
 
-            await asyncio.sleep(0.05)
+            # Wait for both entries to be applied (even though first raises)
+            await wait_until(lambda: raft.last_applied == 2)
 
-            # Both entries should be applied (lastApplied == 2)
-            # even though the first one raised an error
-            assert raft.last_applied == 2
             assert sm._store == {"x": "42"}
         finally:
             task.cancel()
