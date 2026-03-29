@@ -3,7 +3,7 @@ import inspect
 import logging
 import math
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, Final, Iterable, Optional, Set, Tuple
+from typing import Awaitable, Callable, Dict, Final, Iterable, List, Optional, Set, Tuple
 
 from aioraft.client import AbstractRaftClient
 from aioraft.protocol import AbstractRaftProtocol
@@ -77,6 +77,8 @@ class Raft(aobject, AbstractRaftProtocol):
         self.__vote_lock = asyncio.Lock()
         self._vote_request_lock = asyncio.Lock()
 
+        self.__leader_id: Optional[RaftId] = None
+
         server.bind(self)
 
     async def __ainit__(self, *args, **kwargs):
@@ -129,7 +131,7 @@ class Raft(aobject, AbstractRaftProtocol):
         """
         self.__current_term: AtomicInteger = AtomicInteger(0)
         self.__voted_for: Optional[RaftId] = None
-        self.__log: Iterable[raft_pb2.Log] = []
+        self.__log: List[raft_pb2.Log] = []
 
     async def _initialize_volatile_state(self) -> None:
         """Volatile state on all servers
@@ -154,8 +156,13 @@ class Raft(aobject, AbstractRaftProtocol):
             for each server, index of highest log entry known to be replicated on server
             (initialized to 0, increases monotonically)
         """
-        self.__next_index: Dict[RaftId, int] = {}
-        self.__match_index: Dict[RaftId, int] = {}
+        last_log_index = len(self.__log)
+        self.__next_index: Dict[RaftId, int] = {
+            peer: last_log_index + 1 for peer in self.__configuration
+        }
+        self.__match_index: Dict[RaftId, int] = {
+            peer: 0 for peer in self.__configuration
+        }
 
     async def _reset_election_timeout(self) -> None:
         self.__election_timeout: float = randrangef(0.15, 0.3)
@@ -222,31 +229,101 @@ class Raft(aobject, AbstractRaftProtocol):
             if sum(grants) + 1 >= self.quorum:
                 await self.__change_state(RaftState.LEADER)
 
+    def _append_entry(self, command: str) -> raft_pb2.Log:
+        """Append a new entry to the local log. Returns the created entry."""
+        index = len(self.__log) + 1
+        entry = raft_pb2.Log(
+            index=index,
+            term=self.current_term,
+            command=command,
+        )
+        self.__log.append(entry)
+        return entry
+
+    async def _replicate_to_peer(self, peer_id: RaftId) -> Tuple[int, bool]:
+        """Send AppendEntries RPC to a single peer with entries from nextIndex onwards.
+
+        Returns (term, success) from the peer's response.
+        """
+        next_idx = self.__next_index.get(peer_id, 1)
+        prev_log_index = next_idx - 1
+        prev_log_term = 0
+        if prev_log_index > 0:
+            prev_entry = self._log_at_index(prev_log_index)
+            if prev_entry is not None:
+                prev_log_term = prev_entry.term
+
+        # Entries from nextIndex to end of log
+        entries = self.__log[next_idx - 1:] if next_idx - 1 < len(self.__log) else []
+
+        term, success = await self.__client.append_entries(
+            to=peer_id,
+            term=self.current_term,
+            leader_id=self.id,
+            prev_log_index=prev_log_index,
+            prev_log_term=prev_log_term,
+            entries=entries,
+            leader_commit=self.__commit_index,
+        )
+        return term, success
+
     async def _publish_heartbeat(self) -> None:
         if not self.has_leadership():
             return
-        terms, successes = zip(
-            *await asyncio.gather(
-                *[
-                    asyncio.create_task(
-                        self.__client.append_entries(
-                            to=server,
-                            term=self.current_term,
-                            leader_id=self.id,
-                            prev_log_index=0,
-                            prev_log_term=0,
-                            entries=(),
-                            leader_commit=self.__commit_index,
-                        ),
-                    )
-                    for server in self.__configuration
-                ]
-            )
+
+        results = await asyncio.gather(
+            *[
+                asyncio.create_task(self._replicate_to_peer(server))
+                for server in self.__configuration
+            ]
         )
-        for term in terms:
+
+        for peer_id, (term, success) in zip(self.__configuration, results):
             if term > self.current_term:
                 await self.__synchronize_term(term)
+                return
+            if success:
+                # Update nextIndex and matchIndex on success
+                last_log_index = len(self.__log)
+                self.__next_index[peer_id] = last_log_index + 1
+                self.__match_index[peer_id] = last_log_index
+            else:
+                # Decrement nextIndex on failure (log inconsistency)
+                current_next = self.__next_index.get(peer_id, 1)
+                if current_next > 1:
+                    self.__next_index[peer_id] = current_next - 1
+
+        # After processing all responses, check if we can advance commitIndex
+        self._update_leader_commit_index()
+
+    def _update_leader_commit_index(self) -> None:
+        """Advance commitIndex if a majority of matchIndex[i] >= N for some N > commitIndex
+        and log[N].term == currentTerm."""
+        if not self.has_leadership():
+            return
+
+        for n in range(len(self.__log), self.__commit_index, -1):
+            entry = self._log_at_index(n)
+            if entry is None or entry.term != self.current_term:
+                continue
+
+            # Count replicas: leader itself counts as 1
+            replication_count = 1
+            for peer_id in self.__configuration:
+                if self.__match_index.get(peer_id, 0) >= n:
+                    replication_count += 1
+
+            if replication_count >= self.quorum:
+                self._update_commit_index(n)
                 break
+
+    async def _wait_for_commit(self, index: int) -> None:
+        """Block until commitIndex >= index."""
+        while self.__commit_index < index:
+            self.__commit_event.clear()
+            if self.__commit_index >= index:
+                return
+            await self.__commit_event.wait()
 
     def has_leadership(self) -> bool:
         return self.__state is RaftState.LEADER
@@ -254,6 +331,33 @@ class Raft(aobject, AbstractRaftProtocol):
     """
     AbstractRaftProtocol
     """
+
+    async def on_client_request(self, command: str) -> Tuple[bool, str, Optional[str]]:
+        """Handle a client command request.
+
+        Returns (success, result, leader_hint).
+        """
+        if not self.has_leadership():
+            return (False, "", self.__leader_id)
+
+        # Append to local log
+        entry = self._append_entry(command)
+        target_index = entry.index
+
+        # Wait for the entry to be committed (replicated to a majority)
+        try:
+            await asyncio.wait_for(self._wait_for_commit(target_index), timeout=5.0)
+        except asyncio.TimeoutError:
+            return (False, "timeout waiting for commit", None)
+
+        # Apply and get result
+        if self.__state_machine:
+            try:
+                result = await self.__state_machine.apply(command)
+                return (True, str(result) if result is not None else "", None)
+            except Exception as e:
+                return (False, str(e), None)
+        return (True, "", None)
 
     async def on_append_entries(
         self,
@@ -265,13 +369,47 @@ class Raft(aobject, AbstractRaftProtocol):
         entries: Iterable[raft_pb2.Log],
         leader_commit: int,
     ) -> Tuple[int, bool]:
+        # Rule 1: Reply false if term < currentTerm
         if term < (current_term := self.current_term):
             return (current_term, False)
+
         await self.__reset_timeout()
         await self.__synchronize_term(term)
+
+        # Track the leader
+        self.__leader_id = leader_id
+
+        # Rule 2: Reply false if log doesn't contain an entry at prevLogIndex
+        # whose term matches prevLogTerm
+        if prev_log_index > 0:
+            prev_entry = self._log_at_index(prev_log_index)
+            if prev_entry is None or prev_entry.term != prev_log_term:
+                return (self.current_term, False)
+
+        # Process entries (rules 3 & 4)
+        entries_list = list(entries)
+        for i, new_entry in enumerate(entries_list):
+            insert_index = prev_log_index + 1 + i
+            existing = self._log_at_index(insert_index)
+            if existing is not None:
+                if existing.term != new_entry.term:
+                    # Rule 3: conflict - delete existing entry and all following
+                    self.__log = self.__log[:insert_index - 1]
+                    # Rule 4: append this and remaining entries
+                    self.__log.append(new_entry)
+                else:
+                    # Entry already exists with same term, skip
+                    pass
+            else:
+                # Rule 4: append new entry
+                self.__log.append(new_entry)
+
+        # Rule 5: advance commitIndex
         if leader_commit > self.__commit_index:
-            self.__commit_index = min(leader_commit, len(self.__log))
+            last_new_index = prev_log_index + len(entries_list) if entries_list else len(self.__log)
+            self.__commit_index = min(leader_commit, max(last_new_index, len(self.__log)))
             self.__commit_event.set()
+
         return (self.current_term, True)
 
     async def on_request_vote(

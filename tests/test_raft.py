@@ -345,3 +345,482 @@ class TestApplyLoop:
         )
 
         assert raft.last_applied == 0
+
+
+class TestClientRequest:
+    """Tests for the on_client_request interface."""
+
+    @pytest.mark.asyncio
+    async def test_non_leader_returns_failure_with_leader_hint(self):
+        """A non-leader should return (False, '', leader_hint)."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2", "node-3"],
+        )
+
+        # Node is a follower by default
+        assert raft.state == RaftState.FOLLOWER
+
+        # Set a known leader
+        raft._Raft__leader_id = "node-2"
+
+        success, result, leader_hint = await raft.on_client_request("SET foo bar")
+        assert success is False
+        assert result == ""
+        assert leader_hint == "node-2"
+
+    @pytest.mark.asyncio
+    async def test_non_leader_returns_none_leader_hint_when_unknown(self):
+        """When no leader is known, leader_hint should be None."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2", "node-3"],
+        )
+
+        success, result, leader_hint = await raft.on_client_request("SET foo bar")
+        assert success is False
+        assert leader_hint is None
+
+    @pytest.mark.asyncio
+    async def test_leader_commits_without_state_machine(self):
+        """Leader with no state machine should still commit and return success."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.request_vote = AsyncMock(return_value=(1, True))
+        mock_client.append_entries = AsyncMock(return_value=(1, True))
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2", "node-3"],
+        )
+
+        # Make the node a leader
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(1)
+        await raft._initialize_leader_volatile_state()
+
+        # Simulate replication happening in a background task
+        async def simulate_replication():
+            # Wait a tiny bit for the entry to be appended
+            await asyncio.sleep(0.01)
+            # Simulate peers having replicated
+            for peer in raft._Raft__configuration:
+                raft._Raft__match_index[peer] = len(raft._Raft__log)
+                raft._Raft__next_index[peer] = len(raft._Raft__log) + 1
+            # Update commit index as the leader would
+            raft._update_leader_commit_index()
+
+        repl_task = asyncio.create_task(simulate_replication())
+        try:
+            success, result, leader_hint = await raft.on_client_request("SET foo bar")
+            assert success is True
+            assert result == ""
+            assert leader_hint is None
+        finally:
+            repl_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await repl_task
+
+    @pytest.mark.asyncio
+    async def test_leader_full_flow_with_state_machine(self):
+        """Full flow: leader appends, commits (mock replication), applies via state machine."""
+        sm = KeyValueStateMachine()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.request_vote = AsyncMock(return_value=(1, True))
+        mock_client.append_entries = AsyncMock(return_value=(1, True))
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2", "node-3"],
+            state_machine=sm,
+        )
+
+        # Make the node a leader
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(1)
+        await raft._initialize_leader_volatile_state()
+
+        async def simulate_replication():
+            await asyncio.sleep(0.01)
+            for peer in raft._Raft__configuration:
+                raft._Raft__match_index[peer] = len(raft._Raft__log)
+                raft._Raft__next_index[peer] = len(raft._Raft__log) + 1
+            raft._update_leader_commit_index()
+
+        repl_task = asyncio.create_task(simulate_replication())
+        try:
+            success, result, leader_hint = await raft.on_client_request("SET mykey myval")
+            assert success is True
+            assert result == "myval"
+            assert leader_hint is None
+        finally:
+            repl_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await repl_task
+
+    @pytest.mark.asyncio
+    async def test_leader_timeout_on_no_replication(self):
+        """If replication never happens, on_client_request should time out."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.append_entries = AsyncMock(return_value=(1, False))
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2", "node-3"],
+        )
+
+        # Make leader
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(1)
+        await raft._initialize_leader_volatile_state()
+
+        # Patch the timeout to be very short for test speed
+        import unittest.mock as um
+        with um.patch("aioraft.raft.asyncio.wait_for", side_effect=asyncio.TimeoutError):
+            success, result, leader_hint = await raft.on_client_request("SET foo bar")
+            assert success is False
+            assert result == "timeout waiting for commit"
+
+
+class TestLogReplication:
+    """Tests for log replication helpers."""
+
+    @pytest.mark.asyncio
+    async def test_replicate_to_peer_constructs_correct_append_entries(self):
+        """_replicate_to_peer should send entries from nextIndex onwards."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.append_entries = AsyncMock(return_value=(1, True))
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+        )
+
+        # Make leader with some log entries
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(1)
+        raft._Raft__log = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b 2"),
+            raft_pb2.Log(index=3, term=1, command="SET c 3"),
+        ]
+        # nextIndex for node-2 is 2 (needs entries 2 and 3)
+        raft._Raft__next_index = {"node-2": 2}
+        raft._Raft__match_index = {"node-2": 1}
+
+        term, success = await raft._replicate_to_peer("node-2")
+        assert success is True
+
+        # Verify the call
+        call_kwargs = mock_client.append_entries.call_args[1]
+        assert call_kwargs["to"] == "node-2"
+        assert call_kwargs["prev_log_index"] == 1
+        assert call_kwargs["prev_log_term"] == 1
+        assert len(call_kwargs["entries"]) == 2  # entries at index 2 and 3
+
+    @pytest.mark.asyncio
+    async def test_publish_heartbeat_updates_next_and_match_index(self):
+        """_publish_heartbeat should update nextIndex/matchIndex on success."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.append_entries = AsyncMock(return_value=(1, True))
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2", "node-3"],
+        )
+
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(1)
+        raft._Raft__log = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+        ]
+        await raft._initialize_leader_volatile_state()
+
+        await raft._publish_heartbeat()
+
+        # Both peers should now have nextIndex = 2, matchIndex = 1
+        for peer in ["node-2", "node-3"]:
+            assert raft._Raft__next_index[peer] == 2
+            assert raft._Raft__match_index[peer] == 1
+
+    @pytest.mark.asyncio
+    async def test_publish_heartbeat_decrements_next_index_on_failure(self):
+        """On AppendEntries failure, nextIndex should be decremented."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.append_entries = AsyncMock(return_value=(1, False))
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+        )
+
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(1)
+        raft._Raft__log = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b 2"),
+        ]
+        raft._Raft__next_index = {"node-2": 3}
+        raft._Raft__match_index = {"node-2": 0}
+
+        await raft._publish_heartbeat()
+
+        # nextIndex should have been decremented from 3 to 2
+        assert raft._Raft__next_index["node-2"] == 2
+
+    @pytest.mark.asyncio
+    async def test_update_leader_commit_index_advances_on_majority(self):
+        """commitIndex should advance when a majority has replicated."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2", "node-3"],
+        )
+
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(1)
+        raft._Raft__log = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b 2"),
+        ]
+        raft._Raft__commit_index = 0
+        # node-2 has replicated up to index 2, node-3 only up to 1
+        raft._Raft__match_index = {"node-2": 2, "node-3": 1}
+
+        raft._update_leader_commit_index()
+
+        # With 3 nodes (leader + 2), quorum = 2
+        # Leader has all entries, node-2 has up to 2 -> majority for index 2
+        assert raft.commit_index == 2
+
+    @pytest.mark.asyncio
+    async def test_update_leader_commit_index_only_current_term(self):
+        """commitIndex should not advance for entries from previous terms."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2", "node-3"],
+        )
+
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(2)
+        raft._Raft__log = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),  # old term
+        ]
+        raft._Raft__commit_index = 0
+        raft._Raft__match_index = {"node-2": 1, "node-3": 1}
+
+        raft._update_leader_commit_index()
+
+        # Entry at index 1 is from term 1, but current term is 2
+        # Per Raft paper, leader can only commit entries from its own term
+        assert raft.commit_index == 0
+
+
+class TestAppendEntriesFullProtocol:
+    """Tests for the full 5-rule AppendEntries receiver implementation."""
+
+    @pytest.mark.asyncio
+    async def test_appends_new_entries(self):
+        """Follower should append new entries from the leader."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+        )
+
+        raft._Raft__current_term.set(1)
+
+        entries = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b 2"),
+        ]
+
+        term, success = await raft.on_append_entries(
+            term=1,
+            leader_id="leader",
+            prev_log_index=0,
+            prev_log_term=0,
+            entries=entries,
+            leader_commit=0,
+        )
+
+        assert success is True
+        assert len(raft._Raft__log) == 2
+        assert raft._Raft__log[0].command == "SET a 1"
+        assert raft._Raft__log[1].command == "SET b 2"
+
+    @pytest.mark.asyncio
+    async def test_rejects_if_prev_log_mismatch(self):
+        """Should return False if prevLogIndex entry has wrong term."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+        )
+
+        raft._Raft__current_term.set(2)
+        raft._Raft__log = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+        ]
+
+        # prevLogIndex=1, prevLogTerm=2 but actual term at index 1 is 1
+        term, success = await raft.on_append_entries(
+            term=2,
+            leader_id="leader",
+            prev_log_index=1,
+            prev_log_term=2,
+            entries=[raft_pb2.Log(index=2, term=2, command="SET b 2")],
+            leader_commit=0,
+        )
+
+        assert success is False
+
+    @pytest.mark.asyncio
+    async def test_truncates_conflicting_entries(self):
+        """If existing entry conflicts with new one, delete it and following."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+        )
+
+        raft._Raft__current_term.set(2)
+        raft._Raft__log = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b OLD"),
+            raft_pb2.Log(index=3, term=1, command="SET c OLD"),
+        ]
+
+        # Leader sends entry at index 2 with term 2 (conflicts with existing term 1)
+        term, success = await raft.on_append_entries(
+            term=2,
+            leader_id="leader",
+            prev_log_index=1,
+            prev_log_term=1,
+            entries=[raft_pb2.Log(index=2, term=2, command="SET b NEW")],
+            leader_commit=0,
+        )
+
+        assert success is True
+        assert len(raft._Raft__log) == 2
+        assert raft._Raft__log[1].command == "SET b NEW"
+        assert raft._Raft__log[1].term == 2
+
+    @pytest.mark.asyncio
+    async def test_advances_commit_index(self):
+        """commitIndex should advance when leaderCommit > commitIndex."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+        )
+
+        raft._Raft__current_term.set(1)
+        raft._Raft__log = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+        ]
+
+        term, success = await raft.on_append_entries(
+            term=1,
+            leader_id="leader",
+            prev_log_index=1,
+            prev_log_term=1,
+            entries=[raft_pb2.Log(index=2, term=1, command="SET b 2")],
+            leader_commit=2,
+        )
+
+        assert success is True
+        assert raft.commit_index == 2
+
+    @pytest.mark.asyncio
+    async def test_tracks_leader_id(self):
+        """on_append_entries should track the leader's identity."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+        )
+
+        raft._Raft__current_term.set(1)
+
+        await raft.on_append_entries(
+            term=1,
+            leader_id="the-leader",
+            prev_log_index=0,
+            prev_log_term=0,
+            entries=(),
+            leader_commit=0,
+        )
+
+        assert raft._Raft__leader_id == "the-leader"
