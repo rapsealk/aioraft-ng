@@ -65,6 +65,21 @@ class Storage(abc.ABC):
         """Returns (last_included_index, last_included_term, data) or None."""
         ...
 
+    @abc.abstractmethod
+    async def compact_log_with_snapshot(
+        self,
+        last_included_index: int,
+        last_included_term: int,
+        data: bytes,
+        remaining_logs: List[raft_pb2.Log],
+    ) -> None:
+        """Atomically save a snapshot and replace all logs with *remaining_logs*.
+
+        This must be done in a single transaction so that a crash cannot leave
+        storage in an inconsistent state (e.g. snapshot saved but logs lost).
+        """
+        ...
+
 
 class MemoryStorage(Storage):
     """In-memory storage for testing."""
@@ -112,6 +127,16 @@ class MemoryStorage(Storage):
 
     async def load_snapshot(self) -> Optional[Tuple[int, int, bytes]]:
         return self._snapshot
+
+    async def compact_log_with_snapshot(
+        self,
+        last_included_index: int,
+        last_included_term: int,
+        data: bytes,
+        remaining_logs: List[raft_pb2.Log],
+    ) -> None:
+        self._snapshot = (last_included_index, last_included_term, data)
+        self._logs = list(remaining_logs)
 
 
 class SQLiteStorage(Storage):
@@ -286,3 +311,40 @@ class SQLiteStorage(Storage):
         if row:
             return (row[0], row[1], row[2])
         return None
+
+    async def compact_log_with_snapshot(
+        self,
+        last_included_index: int,
+        last_included_term: int,
+        data: bytes,
+        remaining_logs: List[raft_pb2.Log],
+    ) -> None:
+        await asyncio.to_thread(
+            self._compact_log_with_snapshot_sync,
+            last_included_index, last_included_term, data, remaining_logs,
+        )
+
+    def _compact_log_with_snapshot_sync(
+        self,
+        last_included_index: int,
+        last_included_term: int,
+        data: bytes,
+        remaining_logs: List[raft_pb2.Log],
+    ) -> None:
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO raft_snapshot (id, last_included_index, last_included_term, data) "
+                "VALUES (1, ?, ?, ?)",
+                (last_included_index, last_included_term, data),
+            )
+            self._conn.execute("DELETE FROM raft_log")
+            if remaining_logs:
+                self._conn.executemany(
+                    "INSERT INTO raft_log (idx, term, command) VALUES (?, ?, ?)",
+                    [(e.index, e.term, e.command) for e in remaining_logs],
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise

@@ -282,20 +282,37 @@ class Raft(aobject, AbstractRaftProtocol):
         next_idx = self.__next_index.get(peer_id, 1)
 
         # If follower is behind snapshot, send InstallSnapshot
-        if next_idx <= self.__last_included_index and self.__state_machine:
-            data = await self.__state_machine.snapshot()
+        if next_idx <= self.__last_included_index:
+            # Prefer the persisted snapshot so metadata and data are consistent.
+            snapshot_data = None
+            snap_idx = self.__last_included_index
+            snap_term = self.__last_included_term
+            if self.__storage:
+                persisted = await self.__storage.load_snapshot()
+                if persisted is not None:
+                    snap_idx, snap_term, snapshot_data = persisted
+            # Fall back to a live snapshot with correct metadata when no
+            # persisted snapshot is available.
+            if snapshot_data is None and self.__state_machine:
+                snapshot_data = await self.__state_machine.snapshot()
+                snap_idx = self.__last_applied
+                entry = self._log_at_index(snap_idx)
+                snap_term = entry.term if entry else self.__last_included_term
+            if snapshot_data is None:
+                # Cannot send snapshot; let caller retry later.
+                return self.current_term, False
             (resp_term,) = await self.__client.install_snapshot(
                 to=peer_id,
                 term=self.current_term,
                 leader_id=self.id,
-                last_included_index=self.__last_included_index,
-                last_included_term=self.__last_included_term,
-                data=data,
+                last_included_index=snap_idx,
+                last_included_term=snap_term,
+                data=snapshot_data,
             )
             if resp_term > self.current_term:
                 return resp_term, False
-            self.__next_index[peer_id] = self.__last_included_index + 1
-            self.__match_index[peer_id] = self.__last_included_index
+            self.__next_index[peer_id] = snap_idx + 1
+            self.__match_index[peer_id] = snap_idx
             return resp_term, True
 
         prev_log_index = next_idx - 1
@@ -583,17 +600,16 @@ class Raft(aobject, AbstractRaftProtocol):
             return
         last_term = last_entry.term
 
-        if self.__storage:
-            await self.__storage.save_snapshot(last_index, last_term, data)
-
         # Discard compacted log entries
-        entries_to_keep = last_index - self.__last_included_index
-        self.__log = self.__log[entries_to_keep:]
+        entries_to_discard = last_index - self.__last_included_index
+        remaining_logs = self.__log[entries_to_discard:]
 
         if self.__storage:
-            await self.__storage.truncate_logs_from(1)
-            await self.__storage.append_logs(self.__log)
+            await self.__storage.compact_log_with_snapshot(
+                last_index, last_term, data, remaining_logs,
+            )
 
+        self.__log = remaining_logs
         self.__last_included_index = last_index
         self.__last_included_term = last_term
 
@@ -610,6 +626,10 @@ class Raft(aobject, AbstractRaftProtocol):
         if term < self.current_term:
             return (self.current_term,)
 
+        # B4: Guard against stale/duplicate snapshots
+        if last_included_index <= self.__last_included_index:
+            return (self.current_term,)
+
         await self.__synchronize_term(term)
         await self.__reset_timeout()
         self.__leader_id = leader_id
@@ -619,17 +639,19 @@ class Raft(aobject, AbstractRaftProtocol):
             await self.__state_machine.restore(data)
 
         # Discard entire log up to snapshot
-        self.__log = [e for e in self.__log if e.index > last_included_index]
+        remaining_logs = [e for e in self.__log if e.index > last_included_index]
+
+        # Persist atomically
+        if self.__storage:
+            await self.__storage.compact_log_with_snapshot(
+                last_included_index, last_included_term, data, remaining_logs,
+            )
+
+        self.__log = remaining_logs
         self.__last_included_index = last_included_index
         self.__last_included_term = last_included_term
         self.__commit_index = max(self.__commit_index, last_included_index)
         self.__last_applied = last_included_index
-
-        # Persist
-        if self.__storage:
-            await self.__storage.save_snapshot(last_included_index, last_included_term, data)
-            await self.__storage.truncate_logs_from(1)
-            await self.__storage.append_logs(self.__log)
 
         return (self.current_term,)
 

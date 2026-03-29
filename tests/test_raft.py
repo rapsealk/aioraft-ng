@@ -2102,3 +2102,301 @@ class TestSnapshotStorage:
         assert result[0] == 10
         assert result[1] == 2
         assert result[2] == snapshot_data
+
+
+class TestCompactLogWithSnapshot:
+    """Tests for the atomic compact_log_with_snapshot storage method (B1 fix)."""
+
+    @pytest.mark.asyncio
+    async def test_memory_compact_log_with_snapshot(self):
+        storage = MemoryStorage()
+        logs = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b 2"),
+            raft_pb2.Log(index=3, term=2, command="SET c 3"),
+        ]
+        await storage.append_logs(logs)
+
+        remaining = [raft_pb2.Log(index=3, term=2, command="SET c 3")]
+        await storage.compact_log_with_snapshot(2, 1, b"snap", remaining)
+
+        snapshot = await storage.load_snapshot()
+        assert snapshot == (2, 1, b"snap")
+        loaded_logs = await storage.load_logs()
+        assert len(loaded_logs) == 1
+        assert loaded_logs[0].index == 3
+
+    @pytest.mark.asyncio
+    async def test_sqlite_compact_log_with_snapshot(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            await storage.initialize()
+
+            logs = [
+                raft_pb2.Log(index=1, term=1, command="SET a 1"),
+                raft_pb2.Log(index=2, term=1, command="SET b 2"),
+                raft_pb2.Log(index=3, term=2, command="SET c 3"),
+            ]
+            await storage.append_logs(logs)
+
+            remaining = [raft_pb2.Log(index=3, term=2, command="SET c 3")]
+            await storage.compact_log_with_snapshot(2, 1, b"snap", remaining)
+
+            snapshot = await storage.load_snapshot()
+            assert snapshot == (2, 1, b"snap")
+            loaded_logs = await storage.load_logs()
+            assert len(loaded_logs) == 1
+            assert loaded_logs[0].index == 3
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_compact_log_with_snapshot_empty_remaining(self):
+        storage = MemoryStorage()
+        await storage.append_logs([raft_pb2.Log(index=1, term=1, command="x")])
+        await storage.compact_log_with_snapshot(1, 1, b"snap", [])
+
+        snapshot = await storage.load_snapshot()
+        assert snapshot == (1, 1, b"snap")
+        assert await storage.load_logs() == []
+
+
+class TestStaleSnapshotGuard:
+    """Tests for B4: guard against stale/duplicate InstallSnapshot RPCs."""
+
+    @pytest.mark.asyncio
+    async def test_stale_snapshot_rejected(self):
+        """InstallSnapshot with last_included_index <= current should be rejected."""
+        sm = KeyValueStateMachine()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            state_machine=sm,
+        )
+
+        # Pre-set snapshot metadata to simulate having a snapshot at index 10
+        raft._Raft__last_included_index = 10
+        raft._Raft__last_included_term = 3
+        raft._Raft__current_term.set(5)
+
+        import json
+        old_data = json.dumps({"old": "data"}).encode("utf-8")
+
+        # Try to install a snapshot at index 8 (older)
+        (resp_term,) = await raft.on_install_snapshot(
+            term=5,
+            leader_id="leader",
+            last_included_index=8,
+            last_included_term=2,
+            data=old_data,
+        )
+
+        assert resp_term == 5
+        # State should be unchanged
+        assert raft._Raft__last_included_index == 10
+        assert raft._Raft__last_included_term == 3
+
+    @pytest.mark.asyncio
+    async def test_duplicate_snapshot_rejected(self):
+        """InstallSnapshot with same last_included_index should be rejected."""
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+        )
+
+        raft._Raft__last_included_index = 5
+        raft._Raft__last_included_term = 2
+        raft._Raft__current_term.set(3)
+
+        (resp_term,) = await raft.on_install_snapshot(
+            term=3,
+            leader_id="leader",
+            last_included_index=5,
+            last_included_term=2,
+            data=b"{}",
+        )
+
+        assert resp_term == 3
+        # Index should remain unchanged (not re-processed)
+        assert raft._Raft__last_included_index == 5
+
+    @pytest.mark.asyncio
+    async def test_newer_snapshot_accepted(self):
+        """InstallSnapshot with greater last_included_index should be accepted."""
+        sm = KeyValueStateMachine()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            state_machine=sm,
+        )
+
+        raft._Raft__last_included_index = 5
+        raft._Raft__last_included_term = 2
+        raft._Raft__current_term.set(3)
+
+        import json
+        snapshot_data = json.dumps({"new": "state"}).encode("utf-8")
+
+        (resp_term,) = await raft.on_install_snapshot(
+            term=3,
+            leader_id="leader",
+            last_included_index=10,
+            last_included_term=3,
+            data=snapshot_data,
+        )
+
+        assert resp_term == 3
+        assert raft._Raft__last_included_index == 10
+        assert raft._Raft__last_included_term == 3
+
+
+class TestLeaderSendsPersistedSnapshot:
+    """Tests for B3: leader sends persisted snapshot, not live state."""
+
+    @pytest.mark.asyncio
+    async def test_replicate_uses_persisted_snapshot(self):
+        """Leader should use stored snapshot data, not live state machine snapshot."""
+        sm = KeyValueStateMachine()
+        storage = MemoryStorage()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.install_snapshot = AsyncMock(return_value=(1,))
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            state_machine=sm,
+            storage=storage,
+        )
+
+        # Store a persisted snapshot at index 5
+        await storage.save_snapshot(5, 2, b"persisted-snapshot-data")
+
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(3)
+        raft._Raft__last_included_index = 5
+        raft._Raft__last_included_term = 2
+        raft._Raft__log = []
+        await raft._initialize_leader_volatile_state()
+
+        # Set follower's nextIndex behind snapshot
+        raft._Raft__next_index["node-2"] = 3
+
+        # Apply more entries to state machine (making live state ahead of snapshot)
+        await sm.apply("SET extra 999")
+
+        await raft._replicate_to_peer("node-2")
+
+        # Verify install_snapshot was called with PERSISTED data, not live
+        mock_client.install_snapshot.assert_called_once()
+        call_kwargs = mock_client.install_snapshot.call_args
+        assert call_kwargs.kwargs["data"] == b"persisted-snapshot-data"
+        assert call_kwargs.kwargs["last_included_index"] == 5
+        assert call_kwargs.kwargs["last_included_term"] == 2
+
+    @pytest.mark.asyncio
+    async def test_replicate_falls_back_to_live_snapshot(self):
+        """When no persisted snapshot exists, fall back to live snapshot."""
+        sm = KeyValueStateMachine()
+        await sm.apply("SET k1 v1")
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.install_snapshot = AsyncMock(return_value=(1,))
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            state_machine=sm,
+        )
+
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(3)
+        raft._Raft__last_included_index = 5
+        raft._Raft__last_included_term = 2
+        raft._Raft__last_applied = 5
+        raft._Raft__log = []
+        await raft._initialize_leader_volatile_state()
+        raft._Raft__next_index["node-2"] = 3
+
+        await raft._replicate_to_peer("node-2")
+
+        # Should still call install_snapshot (with live data)
+        mock_client.install_snapshot.assert_called_once()
+
+
+class TestSnapshotBinarySerialization:
+    """Tests for B2: binary serialization of snapshot messages."""
+
+    def test_install_snapshot_request_roundtrip(self):
+        from aioraft.protos.raft_pb2 import InstallSnapshotRequest
+
+        req = InstallSnapshotRequest(
+            term=42,
+            leader_id="leader-node-1",
+            last_included_index=100,
+            last_included_term=10,
+            data=b"\x00\x01\x02\xff",
+        )
+        serialized = req.SerializeToString()
+        restored = InstallSnapshotRequest.FromString(serialized)
+
+        assert restored.term == 42
+        assert restored.leader_id == "leader-node-1"
+        assert restored.last_included_index == 100
+        assert restored.last_included_term == 10
+        assert restored.data == b"\x00\x01\x02\xff"
+
+    def test_install_snapshot_response_roundtrip(self):
+        from aioraft.protos.raft_pb2 import InstallSnapshotResponse
+
+        resp = InstallSnapshotResponse(term=7)
+        serialized = resp.SerializeToString()
+        restored = InstallSnapshotResponse.FromString(serialized)
+
+        assert restored.term == 7
+
+    def test_install_snapshot_request_empty_data(self):
+        from aioraft.protos.raft_pb2 import InstallSnapshotRequest
+
+        req = InstallSnapshotRequest(term=1, leader_id="", data=b"")
+        serialized = req.SerializeToString()
+        restored = InstallSnapshotRequest.FromString(serialized)
+
+        assert restored.term == 1
+        assert restored.leader_id == ""
+        assert restored.data == b""
+
+    def test_serialization_is_binary_not_json(self):
+        """Verify that serialized form is NOT JSON (B2 fix)."""
+        from aioraft.protos.raft_pb2 import InstallSnapshotRequest
+
+        req = InstallSnapshotRequest(term=1, leader_id="node", data=b"data")
+        serialized = req.SerializeToString()
+
+        # Should NOT be valid JSON
+        import json
+        with pytest.raises((json.JSONDecodeError, UnicodeDecodeError)):
+            json.loads(serialized)
