@@ -111,7 +111,7 @@ class SQLiteStorage(Storage):
         await asyncio.to_thread(self._initialize_sync)
 
     def _initialize_sync(self) -> None:
-        self._conn = sqlite3.connect(self._db_path)
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute(
