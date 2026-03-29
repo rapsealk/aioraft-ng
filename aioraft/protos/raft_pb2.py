@@ -124,3 +124,56 @@ if _descriptor._USE_C_DESCRIPTORS == False:
     _RAFTSERVICE._serialized_start = 574
     _RAFTSERVICE._serialized_end = 773
 # @@protoc_insertion_point(module_scope)
+
+
+# -- Snapshot messages (added manually; no protoc re-generation) --
+
+class InstallSnapshotRequest:
+    """Lightweight protobuf-compatible message for InstallSnapshot RPC request."""
+
+    def __init__(self, term: int = 0, leader_id: str = "", last_included_index: int = 0,
+                 last_included_term: int = 0, data: bytes = b""):
+        self.term = term
+        self.leader_id = leader_id
+        self.last_included_index = last_included_index
+        self.last_included_term = last_included_term
+        self.data = data
+
+    def SerializeToString(self) -> bytes:
+        import json
+        return json.dumps({
+            "term": self.term,
+            "leader_id": self.leader_id,
+            "last_included_index": self.last_included_index,
+            "last_included_term": self.last_included_term,
+            "data": self.data.hex(),
+        }).encode("utf-8")
+
+    @classmethod
+    def FromString(cls, s: bytes) -> "InstallSnapshotRequest":
+        import json
+        d = json.loads(s.decode("utf-8"))
+        return cls(
+            term=d["term"],
+            leader_id=d["leader_id"],
+            last_included_index=d["last_included_index"],
+            last_included_term=d["last_included_term"],
+            data=bytes.fromhex(d["data"]),
+        )
+
+
+class InstallSnapshotResponse:
+    """Lightweight protobuf-compatible message for InstallSnapshot RPC response."""
+
+    def __init__(self, term: int = 0):
+        self.term = term
+
+    def SerializeToString(self) -> bytes:
+        import json
+        return json.dumps({"term": self.term}).encode("utf-8")
+
+    @classmethod
+    def FromString(cls, s: bytes) -> "InstallSnapshotResponse":
+        import json
+        d = json.loads(s.decode("utf-8"))
+        return cls(term=d["term"])
