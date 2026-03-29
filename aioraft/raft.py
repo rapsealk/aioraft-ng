@@ -86,6 +86,7 @@ class Raft(aobject, AbstractRaftProtocol):
 
     async def __ainit__(self, *args, **kwargs):
         if self.__storage:
+            await self.__storage.initialize()
             term = await self.__storage.load_term()
             self.__current_term = AtomicInteger(term)
             self.__voted_for = await self.__storage.load_vote()
@@ -187,14 +188,12 @@ class Raft(aobject, AbstractRaftProtocol):
 
     async def __synchronize_term(self, term: int) -> None:
         if term > self.current_term:
-            self.__current_term.set(term)
             if self.__storage:
-                await self.__storage.save_term(term)
+                await self.__storage.save_term_and_vote(term, None)
+            self.__current_term.set(term)
             await self.__change_state(RaftState.FOLLOWER)
             async with self.__vote_lock:
                 self.__voted_for = None
-                if self.__storage:
-                    await self.__storage.save_vote(None)
 
     async def __change_state(self, next_state: RaftState) -> None:
         if self.__state is next_state:
@@ -210,13 +209,12 @@ class Raft(aobject, AbstractRaftProtocol):
                 callback(next_state)
 
     async def _start_election(self) -> None:
-        self.__current_term.increase()
+        new_term = self.__current_term.value + 1
         if self.__storage:
-            await self.__storage.save_term(self.current_term)
+            await self.__storage.save_term_and_vote(new_term, self.id)
+        self.__current_term.set(new_term)
         async with self.__vote_lock:
             self.__voted_for = self.id
-            if self.__storage:
-                await self.__storage.save_vote(self.id)
 
         current_term = self.current_term
         last_log_index, last_log_term = self._get_last_log_info()
@@ -255,9 +253,9 @@ class Raft(aobject, AbstractRaftProtocol):
             term=self.current_term,
             command=command,
         )
-        self.__log.append(entry)
         if self.__storage:
             await self.__storage.save_log_entry(entry)
+        self.__log.append(entry)
         return entry
 
     async def _replicate_to_peer(self, peer_id: RaftId) -> Tuple[int, bool]:
@@ -408,27 +406,37 @@ class Raft(aobject, AbstractRaftProtocol):
 
         # Process entries (rules 3 & 4)
         entries_list = list(entries)
+        new_entries_to_append: List[raft_pb2.Log] = []
+        truncate_from: Optional[int] = None
+
         for i, new_entry in enumerate(entries_list):
             insert_index = prev_log_index + 1 + i
             existing = self._log_at_index(insert_index)
             if existing is not None:
                 if existing.term != new_entry.term:
-                    # Rule 3: conflict - delete existing entry and all following
-                    self.__log = self.__log[:insert_index - 1]
-                    if self.__storage:
-                        await self.__storage.truncate_logs_from(insert_index)
-                    # Rule 4: append this and remaining entries
-                    self.__log.append(new_entry)
-                    if self.__storage:
-                        await self.__storage.save_log_entry(new_entry)
+                    # Rule 3: conflict - mark truncation point and collect
+                    # this entry plus all remaining entries for append
+                    truncate_from = insert_index
+                    new_entries_to_append = entries_list[i:]
+                    break
                 else:
                     # Entry already exists with same term, skip
                     pass
             else:
-                # Rule 4: append new entry
-                self.__log.append(new_entry)
-                if self.__storage:
-                    await self.__storage.save_log_entry(new_entry)
+                # Rule 4: collect remaining entries for append
+                new_entries_to_append = entries_list[i:]
+                break
+
+        # Persist before updating in-memory state
+        if truncate_from is not None:
+            if self.__storage:
+                await self.__storage.truncate_and_append(truncate_from, new_entries_to_append)
+            self.__log = self.__log[:truncate_from - 1]
+            self.__log.extend(new_entries_to_append)
+        elif new_entries_to_append:
+            if self.__storage:
+                await self.__storage.append_logs(new_entries_to_append)
+            self.__log.extend(new_entries_to_append)
 
         # Rule 5: advance commitIndex
         # Per Raft paper: set commitIndex = min(leaderCommit, index of last new entry)
@@ -471,9 +479,9 @@ class Raft(aobject, AbstractRaftProtocol):
                     log.debug(
                         f"[on_request_vote] TRUE id={self.__id[-5:]} current_term={current_term} candidate={candidate_id[-5:]} term={term} voted_for={self.voted_for}"
                     )
-                    self.__voted_for = candidate_id
                     if self.__storage:
                         await self.__storage.save_vote(candidate_id)
+                    self.__voted_for = candidate_id
                     await self.__reset_timeout()
                     return (self.current_term, True)
             log.debug(

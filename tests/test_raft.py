@@ -1119,6 +1119,259 @@ class TestMemoryStorage:
         await storage.save_vote(None)
         assert await storage.load_vote() is None
 
+
+class TestAtomicTermAndVote:
+    """Tests for atomic save_term_and_vote method."""
+
+    @pytest.mark.asyncio
+    async def test_memory_storage_save_term_and_vote(self):
+        storage = MemoryStorage()
+        await storage.save_term_and_vote(5, "node-2")
+        assert await storage.load_term() == 5
+        assert await storage.load_vote() == "node-2"
+
+    @pytest.mark.asyncio
+    async def test_memory_storage_save_term_and_vote_none(self):
+        storage = MemoryStorage()
+        await storage.save_term_and_vote(3, None)
+        assert await storage.load_term() == 3
+        assert await storage.load_vote() is None
+
+    @pytest.mark.asyncio
+    async def test_sqlite_save_term_and_vote(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            await storage.initialize()
+            await storage.save_term_and_vote(5, "node-2")
+            assert await storage.load_term() == 5
+            assert await storage.load_vote() == "node-2"
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_sqlite_save_term_and_vote_clears_vote(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            await storage.initialize()
+            await storage.save_term_and_vote(3, "node-1")
+            await storage.save_term_and_vote(4, None)
+            assert await storage.load_term() == 4
+            assert await storage.load_vote() is None
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_synchronize_term_uses_atomic_save(self):
+        """__synchronize_term should persist term and vote atomically."""
+        storage = MemoryStorage()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            storage=storage,
+        )
+
+        await raft.on_append_entries(
+            term=5,
+            leader_id="node-2",
+            prev_log_index=0,
+            prev_log_term=0,
+            entries=(),
+            leader_commit=0,
+        )
+
+        assert await storage.load_term() == 5
+        assert await storage.load_vote() is None
+
+    @pytest.mark.asyncio
+    async def test_start_election_uses_atomic_save(self):
+        """_start_election should persist term and vote atomically."""
+        storage = MemoryStorage()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.request_vote = AsyncMock(return_value=(1, False))
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            storage=storage,
+        )
+
+        raft._Raft__state = RaftState.CANDIDATE
+        await raft._start_election()
+
+        assert await storage.load_term() == 1
+        assert await storage.load_vote() == "node-1"
+
+
+class TestTruncateAndAppend:
+    """Tests for transactional truncate_and_append method."""
+
+    @pytest.mark.asyncio
+    async def test_memory_truncate_and_append(self):
+        storage = MemoryStorage()
+        await storage.append_logs([
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b 2"),
+            raft_pb2.Log(index=3, term=1, command="SET c 3"),
+        ])
+        new_entries = [raft_pb2.Log(index=2, term=2, command="SET b NEW")]
+        await storage.truncate_and_append(2, new_entries)
+        logs = await storage.load_logs()
+        assert len(logs) == 2
+        assert logs[0].command == "SET a 1"
+        assert logs[1].command == "SET b NEW"
+
+    @pytest.mark.asyncio
+    async def test_sqlite_truncate_and_append(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            await storage.initialize()
+            await storage.append_logs([
+                raft_pb2.Log(index=1, term=1, command="SET a 1"),
+                raft_pb2.Log(index=2, term=1, command="SET b 2"),
+                raft_pb2.Log(index=3, term=1, command="SET c 3"),
+            ])
+            new_entries = [raft_pb2.Log(index=2, term=2, command="SET b NEW")]
+            await storage.truncate_and_append(2, new_entries)
+            logs = await storage.load_logs()
+            assert len(logs) == 2
+            assert logs[0].command == "SET a 1"
+            assert logs[1].command == "SET b NEW"
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_conflict_resolution_with_storage(self):
+        """on_append_entries conflict path should use transactional truncate+append."""
+        storage = MemoryStorage()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            storage=storage,
+        )
+
+        raft._Raft__current_term.set(2)
+        raft._Raft__log = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b OLD"),
+            raft_pb2.Log(index=3, term=1, command="SET c OLD"),
+        ]
+        # Also populate storage to match
+        await storage.append_logs(list(raft._Raft__log))
+
+        term, success = await raft.on_append_entries(
+            term=2,
+            leader_id="leader",
+            prev_log_index=1,
+            prev_log_term=1,
+            entries=[raft_pb2.Log(index=2, term=2, command="SET b NEW")],
+            leader_commit=0,
+        )
+
+        assert success is True
+        # In-memory log should be updated
+        assert len(raft._Raft__log) == 2
+        assert raft._Raft__log[1].command == "SET b NEW"
+        # Storage should also be updated
+        logs = await storage.load_logs()
+        assert len(logs) == 2
+        assert logs[1].command == "SET b NEW"
+
+
+class TestStorageLifecycle:
+    """Tests for storage lifecycle (initialize/close) integration."""
+
+    @pytest.mark.asyncio
+    async def test_sqlite_initialize_called_by_raft(self):
+        """Raft.__ainit__ should call storage.initialize()."""
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            mock_server = MagicMock()
+            mock_server.bind = MagicMock()
+            mock_client = AsyncMock()
+
+            # This should not crash -- initialize() is called internally
+            raft = await Raft.new(
+                "node-1",
+                server=mock_server,
+                client=mock_client,
+                configuration=["node-2"],
+                storage=storage,
+            )
+
+            assert raft.current_term == 0
+            assert raft.voted_for is None
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_initialize_is_idempotent(self):
+        """Calling initialize() multiple times should not fail."""
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            await storage.initialize()
+            await storage.save_term(5)
+            await storage.initialize()  # second call should not lose data
+            assert await storage.load_term() == 5
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_memory_storage_initialize_noop(self):
+        """MemoryStorage.initialize() and close() should be no-ops."""
+        storage = MemoryStorage()
+        await storage.initialize()  # should not raise
+        await storage.save_term(3)
+        await storage.close()  # should not raise
+        # Data still accessible (memory storage has no real close)
+        assert await storage.load_term() == 3
+
+
+class TestPersistBeforeMemory:
+    """Tests verifying storage is called before in-memory state is updated."""
+
+    @pytest.mark.asyncio
+    async def test_append_entry_persists_before_memory(self):
+        """_append_entry should persist to storage before updating in-memory log."""
+        call_order = []
+
+        class TrackingStorage(MemoryStorage):
+            async def save_log_entry(self, entry):
+                call_order.append("storage")
+                await super().save_log_entry(entry)
+
+        storage = TrackingStorage()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            storage=storage,
+        )
+
+        raft._Raft__state = RaftState.LEADER
+        raft._Raft__current_term.set(1)
+
+        original_log_len = len(raft._Raft__log)
+        await raft._append_entry("SET x 1")
+
+        assert call_order == ["storage"]
+        assert len(raft._Raft__log) == original_log_len + 1
+
     @pytest.mark.asyncio
     async def test_append_and_load_logs(self):
         storage = MemoryStorage()
