@@ -1,11 +1,12 @@
 import asyncio
+import tempfile
 import time
 from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from aioraft import KeyValueStateMachine, Raft
+from aioraft import KeyValueStateMachine, MemoryStorage, Raft, SQLiteStorage
 from aioraft.client import GrpcRaftClient
 from aioraft.protos import raft_pb2
 from aioraft.server import GrpcRaftServer
@@ -1097,3 +1098,332 @@ class TestWaitForCommitLeadershipLoss:
             step_down_task.cancel()
             with suppress(asyncio.CancelledError):
                 await step_down_task
+
+
+class TestMemoryStorage:
+    """Tests for MemoryStorage operations."""
+
+    @pytest.mark.asyncio
+    async def test_save_and_load_term(self):
+        storage = MemoryStorage()
+        assert await storage.load_term() == 0
+        await storage.save_term(5)
+        assert await storage.load_term() == 5
+
+    @pytest.mark.asyncio
+    async def test_save_and_load_vote(self):
+        storage = MemoryStorage()
+        assert await storage.load_vote() is None
+        await storage.save_vote("node-1")
+        assert await storage.load_vote() == "node-1"
+        await storage.save_vote(None)
+        assert await storage.load_vote() is None
+
+    @pytest.mark.asyncio
+    async def test_append_and_load_logs(self):
+        storage = MemoryStorage()
+        entries = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b 2"),
+        ]
+        await storage.append_logs(entries)
+        logs = await storage.load_logs()
+        assert len(logs) == 2
+        assert logs[0].command == "SET a 1"
+        assert logs[1].command == "SET b 2"
+
+    @pytest.mark.asyncio
+    async def test_save_log_entry(self):
+        storage = MemoryStorage()
+        entry = raft_pb2.Log(index=1, term=1, command="SET x 42")
+        await storage.save_log_entry(entry)
+        logs = await storage.load_logs()
+        assert len(logs) == 1
+        assert logs[0].command == "SET x 42"
+
+    @pytest.mark.asyncio
+    async def test_truncate_logs_from(self):
+        storage = MemoryStorage()
+        entries = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b 2"),
+            raft_pb2.Log(index=3, term=1, command="SET c 3"),
+        ]
+        await storage.append_logs(entries)
+        await storage.truncate_logs_from(2)
+        logs = await storage.load_logs()
+        assert len(logs) == 1
+        assert logs[0].index == 1
+
+
+class TestSQLiteStorage:
+    """Tests for SQLiteStorage operations."""
+
+    @pytest.mark.asyncio
+    async def test_save_and_load_term(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            await storage.initialize()
+            assert await storage.load_term() == 0
+            await storage.save_term(5)
+            assert await storage.load_term() == 5
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_save_and_load_vote(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            await storage.initialize()
+            assert await storage.load_vote() is None
+            await storage.save_vote("node-1")
+            assert await storage.load_vote() == "node-1"
+            await storage.save_vote(None)
+            assert await storage.load_vote() is None
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_append_and_load_logs(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            await storage.initialize()
+            entries = [
+                raft_pb2.Log(index=1, term=1, command="SET a 1"),
+                raft_pb2.Log(index=2, term=1, command="SET b 2"),
+            ]
+            await storage.append_logs(entries)
+            logs = await storage.load_logs()
+            assert len(logs) == 2
+            assert logs[0].command == "SET a 1"
+            assert logs[1].command == "SET b 2"
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_save_log_entry(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            await storage.initialize()
+            entry = raft_pb2.Log(index=1, term=1, command="SET x 42")
+            await storage.save_log_entry(entry)
+            logs = await storage.load_logs()
+            assert len(logs) == 1
+            assert logs[0].command == "SET x 42"
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_truncate_logs_from(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            storage = SQLiteStorage(db_path=f.name)
+            await storage.initialize()
+            entries = [
+                raft_pb2.Log(index=1, term=1, command="SET a 1"),
+                raft_pb2.Log(index=2, term=1, command="SET b 2"),
+                raft_pb2.Log(index=3, term=1, command="SET c 3"),
+            ]
+            await storage.append_logs(entries)
+            await storage.truncate_logs_from(2)
+            logs = await storage.load_logs()
+            assert len(logs) == 1
+            assert logs[0].index == 1
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_persistence_across_connections(self):
+        """Data should persist after closing and reopening the storage."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        storage = SQLiteStorage(db_path=db_path)
+        await storage.initialize()
+        await storage.save_term(7)
+        await storage.save_vote("node-3")
+        await storage.save_log_entry(raft_pb2.Log(index=1, term=7, command="SET k v"))
+        await storage.close()
+
+        # Reopen
+        storage2 = SQLiteStorage(db_path=db_path)
+        await storage2.initialize()
+        assert await storage2.load_term() == 7
+        assert await storage2.load_vote() == "node-3"
+        logs = await storage2.load_logs()
+        assert len(logs) == 1
+        assert logs[0].command == "SET k v"
+        await storage2.close()
+
+        import os
+        os.unlink(db_path)
+
+
+class TestRaftWithStorage:
+    """Tests that Raft persists state correctly through a Storage backend."""
+
+    @pytest.mark.asyncio
+    async def test_term_persisted_after_synchronize_term(self):
+        """When a higher term is received, it should be persisted."""
+        storage = MemoryStorage()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            storage=storage,
+        )
+
+        # Send AppendEntries with a higher term to trigger __synchronize_term
+        await raft.on_append_entries(
+            term=5,
+            leader_id="node-2",
+            prev_log_index=0,
+            prev_log_term=0,
+            entries=(),
+            leader_commit=0,
+        )
+
+        assert await storage.load_term() == 5
+        assert raft.current_term == 5
+
+    @pytest.mark.asyncio
+    async def test_vote_persisted_after_on_request_vote(self):
+        """When a vote is granted, it should be persisted."""
+        storage = MemoryStorage()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            storage=storage,
+        )
+
+        term, granted = await raft.on_request_vote(
+            term=1,
+            candidate_id="node-2",
+            last_log_index=0,
+            last_log_term=0,
+        )
+
+        assert granted is True
+        assert await storage.load_vote() == "node-2"
+
+    @pytest.mark.asyncio
+    async def test_log_entries_persisted_after_on_append_entries(self):
+        """Log entries should be persisted when received via AppendEntries."""
+        storage = MemoryStorage()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            storage=storage,
+        )
+
+        entries = [
+            raft_pb2.Log(index=1, term=1, command="SET a 1"),
+            raft_pb2.Log(index=2, term=1, command="SET b 2"),
+        ]
+
+        await raft.on_append_entries(
+            term=1,
+            leader_id="node-2",
+            prev_log_index=0,
+            prev_log_term=0,
+            entries=entries,
+            leader_commit=0,
+        )
+
+        logs = await storage.load_logs()
+        assert len(logs) == 2
+        assert logs[0].command == "SET a 1"
+        assert logs[1].command == "SET b 2"
+
+    @pytest.mark.asyncio
+    async def test_state_recovered_from_storage(self):
+        """A new Raft instance should recover state from storage."""
+        storage = MemoryStorage()
+        await storage.save_term(10)
+        await storage.save_vote("node-3")
+        await storage.append_logs([
+            raft_pb2.Log(index=1, term=8, command="SET a 1"),
+            raft_pb2.Log(index=2, term=10, command="SET b 2"),
+        ])
+
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            storage=storage,
+        )
+
+        assert raft.current_term == 10
+        assert raft.voted_for == "node-3"
+        assert len(raft._Raft__log) == 2
+        assert raft._Raft__log[0].command == "SET a 1"
+        assert raft._Raft__log[1].command == "SET b 2"
+
+    @pytest.mark.asyncio
+    async def test_term_and_vote_persisted_during_election(self):
+        """_start_election should persist term increment and self-vote."""
+        storage = MemoryStorage()
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.request_vote = AsyncMock(return_value=(1, False))
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            storage=storage,
+        )
+
+        raft._Raft__state = RaftState.CANDIDATE
+        await raft._start_election()
+
+        assert await storage.load_term() == 1  # incremented from 0
+        assert await storage.load_vote() == "node-1"  # voted for self
+
+    @pytest.mark.asyncio
+    async def test_vote_cleared_on_synchronize_term(self):
+        """When a higher term is seen, votedFor should be cleared in storage."""
+        storage = MemoryStorage()
+        await storage.save_vote("node-2")
+
+        mock_server = MagicMock()
+        mock_server.bind = MagicMock()
+        mock_client = AsyncMock()
+
+        raft = await Raft.new(
+            "node-1",
+            server=mock_server,
+            client=mock_client,
+            configuration=["node-2"],
+            storage=storage,
+        )
+
+        # Trigger synchronize_term with a higher term
+        await raft.on_append_entries(
+            term=10,
+            leader_id="node-2",
+            prev_log_index=0,
+            prev_log_term=0,
+            entries=(),
+            leader_commit=0,
+        )
+
+        assert await storage.load_vote() is None
